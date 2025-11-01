@@ -132,7 +132,7 @@ class BotHunterVKParser {
 
     console.log('🔐 Авторизация через ВК...');
     
-    await this.page.goto(`${this.config.baseUrl}/login`, { 
+    await this.page.goto(`${this.config.baseUrl}`, { 
       waitUntil: 'domcontentloaded' 
     });
 
@@ -197,14 +197,14 @@ class BotHunterVKParser {
     });
 
     this.communityData = await this.page.evaluate(() => {
-      const nameElement = document.querySelector('h1, [class*="title"], [class*="community"]');
+      const nameElement = document.querySelector('a.dark-link');
       const name = nameElement?.textContent?.trim() || 'Unknown Community';
 
       const identifierMatch = document.body.textContent?.match(/ID:\s*(\d+)|Идентификатор:\s*(\d+)/);
       const identifier = identifierMatch?.[1] || identifierMatch?.[2] || '';
 
       let vkUrl = '';
-      const vkLink = document.querySelector('a[href*="vk.com"]');
+      const vkLink = document.querySelector('a.dark-link[href*="vk.com"]');
       if (vkLink) {
         vkUrl = (vkLink as HTMLAnchorElement).href;
       }
@@ -300,7 +300,7 @@ class BotHunterVKParser {
       });
 
       let currentPage = 1;
-      const maxPages = this.config.maxPages || 1000;
+      const maxPages = this.config.maxPages || 10000;
 
       while (currentPage <= maxPages) {
         console.log(`\n📄 Обработка страницы ${currentPage}...`);
@@ -311,11 +311,7 @@ class BotHunterVKParser {
         pageIds.forEach(id => this.userIds.add(id));
 
         const nextButton = await this.page!.$(`
-          button:has-text("Следующ"),
-          button:has-text("Next"),
-          a:has-text("Следующ"),
-          .pagination button:not([disabled]):has-text("→"),
-          [aria-label="Next page"]:not([disabled])
+          #followers-pagination .btn.btn-primary.pagination-btn:not([disabled]):not(.me-1)
         `);
 
         if (nextButton) {
@@ -332,7 +328,7 @@ class BotHunterVKParser {
 
           await nextButton.click();
           await this.page!.waitForLoadState('networkidle');
-          await this.delay(1000, 2000);
+          await this.delay(2000, 3000);
           
           currentPage++;
         } else {
@@ -423,9 +419,9 @@ async function main() {
     outputFile: process.env.OUTPUT_FILE || 'bothunter_results.json',
   });
 
-  console.log('🎯 BotHunter VK Parser - Упрощенная версия');
+  console.log('BotHunter VK Parser');
   console.log('==========================================\n');
-  console.log('📝 Настройки:');
+  console.log('Настройки:');
   console.log(`   Headless: ${process.env.HEADLESS === 'true' ? 'Да' : 'Нет'}`);
   console.log(`   Макс. страниц: ${process.env.MAX_PAGES || 'Все'}`);
   console.log(`   Путь сессии: ${process.env.SESSION_PATH || './browser-session'}\n`);
@@ -433,7 +429,7 @@ async function main() {
   try {
     await parser.parse();
   } catch (error) {
-    console.error('💥 Критическая ошибка:', error);
+    console.error('CRITICAL ERROR:', error);
     process.exit(1);
   }
 }
