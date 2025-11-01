@@ -1,0 +1,35 @@
+{
+  "name": "bothunter-vk-parser",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Упрощенный парсер для BotHunter с авторизацией через ВК",
+  "main": "bothunter-vk-simple.ts",
+  "scripts": {
+    "start": "tsx bothunter-vk-simple.ts",
+    "start:headless": "HEADLESS=true tsx bothunter-vk-simple.ts",
+    "install:playwright": "playwright install chromium",
+    "clear:session": "rm -rf browser-session/",
+    "test": "tsx bothunter-vk-simple.ts MAX_PAGES=2"
+  },
+  "dependencies": {
+    "playwright": "^1.40.0",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.9.2"
+  },
+  "author": "",
+  "license": "ISC",
+  "keywords": [
+    "parser",
+    "bothunter",
+    "vk",
+    "playwright",
+    "web-scraping"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

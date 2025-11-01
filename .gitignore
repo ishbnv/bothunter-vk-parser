@@ -1,0 +1,5 @@
+.env
+node_modules/
+bothunter_results.json
+bothunter_results_ids.txt
+browser-session/
