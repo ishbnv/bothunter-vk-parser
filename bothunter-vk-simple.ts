@@ -1,4 +1,4 @@
-import { chromium, type Browser, type Page } from 'playwright';
+import { chromium, type Browser, type Page, type Locator } from 'playwright';
 import * as fs from 'fs';
 import * as path from 'path';
 import { config as loadEnv } from 'dotenv';
@@ -33,8 +33,8 @@ interface ParserConfig {
   maxPages?: number;
   sessionPath?: string;
   outputFile?: string;
-  /** Режим работы парсера: contacts (по умолчанию) | groups | lists */
-  mode?: 'contacts' | 'groups' | 'lists';
+  /** Режим работы парсера: contacts (по умолчанию) | groups | lists | new-subs */
+  mode?: 'contacts' | 'groups' | 'lists' | 'new-subs';
   /** Фильтры для названий списков на /contacts/lists */
   listFilters?: string[];
   /** Задержка после переключения сообщества (мс) */
@@ -302,6 +302,8 @@ class BotHunterVKParser {
 
       if (mode === 'groups') {
         await this.parseGroupsMode();
+      } else if (mode === 'new-subs') {
+        await this.parseNewSubsMode();
       } else if (mode === 'lists') {
         await this.parseListsMode();
       } else {
@@ -404,6 +406,47 @@ class BotHunterVKParser {
   }
 
   /**
+   * Возвращает локатор кнопки «следующая страница» для разных типов пагинации.
+   * В new-subs «next» имеет класс `.rounded-circle`, в других местах — просто второй `.pagination-btn`.
+   * Ждём, пока кнопка станет доступной (не disabled), в пределах timeoutMs.
+   */
+  private async waitForNextPageButton(timeoutMs = 2500): Promise<Locator | null> {
+    if (!this.page) throw new Error('Браузер не инициализирован');
+
+    // enabled-кандидаты (в порядке приоритета)
+    const enabled = this.page.locator([
+      // new-subs: круглая кнопка справа
+      '#followers-pagination div.d-flex > button.pagination-btn.rounded-circle:not([disabled])',
+      // запасной путь: последний .pagination-btn в правом блоке
+      '#followers-pagination div.d-flex > button.pagination-btn:last-of-type:not([disabled])',
+      // общий случай: «не .me-1» (левая обычно prev с .me-1)
+      '#followers-pagination .pagination-btn:not(.me-1):not([disabled])',
+      '#followers-list-pagination .pagination-btn:not(.me-1):not([disabled])',
+    ].join(', '));
+
+    // любые «next» (могут быть disabled) — чтобы понимать, что DOM уже дорисовался
+    const any = this.page.locator([
+      '#followers-pagination div.d-flex > button.pagination-btn.rounded-circle',
+      '#followers-pagination div.d-flex > button.pagination-btn:last-of-type',
+      '#followers-pagination .pagination-btn:not(.me-1)',
+      '#followers-list-pagination .pagination-btn:not(.me-1)',
+    ].join(', '));
+
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      if (await enabled.count()) return enabled.first();
+      // Если кнопка существует, но disabled — ждём, пока её активирует сервер
+      if (await any.count()) {
+        await this.page.waitForTimeout(500);
+        continue;
+      }
+      // Кнопки ещё вовсе нет — даём UI смонтироваться
+      await this.page.waitForTimeout(500);
+    }
+    return null;
+  }
+
+  /**
    * Сбор ID со всех страниц текущего списка контактов
    * Не меняет текущий URL (важно для списков на /contacts/lists)
    */
@@ -415,6 +458,13 @@ class BotHunterVKParser {
     let currentPage = 1;
     const maxPages = this.config.maxPages || 10000;
 
+    await this.page!.waitForLoadState('networkidle').catch(() => {});
+    const firstReady = await this.waitForAnyUsers(20000);
+    if (!firstReady) {
+      console.log('⏳ Результаты ещё не прогрузились — добавляю небольшую паузу');
+      await this.page!.waitForTimeout(1500);
+    }
+
     while (currentPage <= maxPages) {
       console.log(`\n📄 Обработка страницы ${currentPage}...`);
 
@@ -422,32 +472,66 @@ class BotHunterVKParser {
       console.log(`   Найдено ID: ${pageIds.length}`);
       pageIds.forEach(id => this.userIds.add(id));
 
-      const nextButton = await this.page.$(`#followers-list-pagination .btn.btn-primary.pagination-btn:not([disabled]):not(.me-1), #followers-pagination .btn.btn-primary.pagination-btn:not([disabled]):not(.me-1)`);
-
-      if (nextButton) {
-        const isDisabled = await nextButton.evaluate(btn => {
-          return (btn as HTMLButtonElement).disabled ||
-                 btn.classList.contains('disabled') ||
-                 btn.hasAttribute('disabled');
-        });
-
-        if (isDisabled) {
-          console.log('⚠️ Достигнута последняя страница');
-          break;
-        }
-
-        await nextButton.click();
-        await this.page!.waitForLoadState('networkidle');
-        await this.delay(1000, 2000);
-
-        currentPage++;
-      } else {
-        console.log('⚠️ Кнопка следующей страницы не найдена');
+      // Ждём доступную кнопку «вперёд» (учитываем разную разметку пагинации)
+      const nextEnableWait = parseInt(process.env.NEXT_ENABLE_WAIT_MS || '4000');
+      const nextLocator = await this.waitForNextPageButton(nextEnableWait);
+      if (!nextLocator) {
+        console.log('⚠️ Кнопка следующей страницы не найдена или не активировалась');
         break;
       }
+
+      await nextLocator.scrollIntoViewIfNeeded().catch(() => {});
+      await nextLocator.click({ timeout: 10000 }).catch(() => {});
+      await this.page!.waitForLoadState('networkidle').catch(() => {});
+      await this.delay(6000, 8000);
+
+      currentPage++;
     }
 
     return Array.from(this.userIds);
+  }
+
+  /**
+   * Дожидается, что текущий URL содержит фрагмент (например, '/contacts')
+   */
+  private async waitUrlIncludes(fragment: string, timeoutMs = 60000): Promise<boolean> {
+    if (!this.page) throw new Error('Браузер не инициализирован');
+    try {
+      await this.page.waitForFunction((frag) => location.pathname.includes(frag), fragment, { timeout: timeoutMs });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Надёжно открывает страницу контактов без зависания на networkidle
+   */
+  private async openContactsPage(timeoutMs = 60000): Promise<void> {
+    if (!this.page) throw new Error('Браузер не инициализирован');
+
+    const url = this.page.url();
+    if (!url.includes('/contacts')) {
+      await this.page.goto(`${this.config.baseUrl}/contacts`, { waitUntil: 'domcontentloaded', timeout: timeoutMs }).catch(() => {});
+    }
+
+    await this.page.waitForSelector('#followers-pagination, #followers-list-pagination, button:has-text("Показать"), #filters-items', { timeout: timeoutMs }).catch(() => {});
+    await this.page.waitForTimeout(800);
+  }
+
+  /**
+   * Надёжно открывает страницу сообществ без зависания на networkidle
+   */
+  private async openGroupsPage(timeoutMs = 60000): Promise<void> {
+    if (!this.page) throw new Error('Браузер не инициализирован');
+
+    const url = this.page.url();
+    if (!url.includes('/groups')) {
+      await this.page.goto(`${this.config.baseUrl}/groups`, { waitUntil: 'domcontentloaded', timeout: timeoutMs }).catch(() => {});
+    }
+
+    await this.page.waitForSelector('a[onclick*="change_group_with_channel"]', { timeout: timeoutMs }).catch(() => {});
+    await this.page.waitForTimeout(500);
   }
 
   /**
@@ -459,7 +543,7 @@ class BotHunterVKParser {
     const waitMs = this.config.waitAfterSwitchMs ?? 3000;
 
     console.log('📂 Переход на список сообществ...');
-    await this.page.goto(`${this.config.baseUrl}/groups`, { waitUntil: 'networkidle' });
+    await this.openGroupsPage(6000);
 
     const groups = await this.page.evaluate(() => {
       const anchors = Array.from(document.querySelectorAll('a[onclick*="change_group_with_channel"]')) as HTMLAnchorElement[];
@@ -504,21 +588,36 @@ class BotHunterVKParser {
         await switchCandidate.click();
       } else {
         await this.page.evaluate((id) => {
-          const fn = (window as any).smm?.change_group_with_channel;
-          if (typeof fn === 'function') fn(id, 'VK');
+          const smm = (window as any).smm;
+          // Call with proper "this" binding; some implementations rely on `this.group_change`
+          if (smm && typeof smm.change_group_with_channel === 'function') {
+            smm.change_group_with_channel.call(smm, id, 'VK');
+            return;
+          }
+          // Fallback: try global SMM singleton if present
+          const SMM = (window as any).SMM;
+          if (SMM && typeof SMM.change_group_with_channel === 'function') {
+            SMM.change_group_with_channel.call(SMM, id, 'VK');
+            return;
+          }
+          // Last resort: click the anchor that triggers the change
+          const a = document.querySelector(
+            `a[onclick*="change_group_with_channel('${id}'"]`
+          ) as HTMLAnchorElement | null;
+          if (a) a.click();
         }, g.id);
       }
 
       await this.delay(waitMs, waitMs + 500);
 
       console.log('📋 Открываем контакты выбранного сообщества...');
-      await this.page.goto(`${this.config.baseUrl}/contacts`, { waitUntil: 'networkidle' });
+      await this.openContactsPage(3000);
 
       const ids = await this.collectAllContactIds();
       const savedPath = await this.writeIdsFile(ids, `group_${g.name || g.id}`);
       console.log(`💾 ID сохранены: ${savedPath} (всего: ${ids.length})`);
 
-      await this.page.goto(`${this.config.baseUrl}/groups`, { waitUntil: 'networkidle' });
+      await this.openGroupsPage(10000);
     }
   }
 
@@ -614,6 +713,428 @@ class BotHunterVKParser {
     }
   }
 
+  /** Форматирование даты как dd.MM.yyyy */
+  private formatDateDDMMYYYY(d: Date): string {
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()}`;
+  }
+
+  /**
+   * Ожидаем готовность результатов после «Показать»:
+   *  - либо стабилизировалось ненулевое число ID в DOM,
+   *  - (опционально) разрешаем ранний выход по появлению пагинации.
+   */
+  private async waitForAnyUsers(
+    maxWaitMs: number,
+    opts?: { minStableMs?: number; allowPaginationShortcut?: boolean; requireMinCount?: number }
+  ): Promise<boolean> {
+    const minStableMs = opts?.minStableMs ?? 2000;
+    const allowPaginationShortcut = opts?.allowPaginationShortcut ?? true;
+    const requireMinCount = opts?.requireMinCount ?? 1;
+
+    const start = Date.now();
+    let lastCount = -1;
+    let lastChangeTs = Date.now();
+
+    while (Date.now() - start < maxWaitMs) {
+      try {
+        if (allowPaginationShortcut) {
+          const hasPagination = await this.page!.$('#followers-list-pagination, #followers-pagination');
+          if (hasPagination) {
+            // В некоторых режимах пагинация появляется раньше данных — этот шорткат можно отключить через opts
+            return true;
+          }
+        }
+
+        const ids = await this.extractUserIds();
+        const count = ids.length;
+        if (count !== lastCount) {
+          lastCount = count;
+          lastChangeTs = Date.now();
+        }
+        if (count >= requireMinCount && Date.now() - lastChangeTs >= minStableMs) {
+          return true;
+        }
+      } catch {}
+      await this.page!.waitForTimeout(500);
+    }
+    return false;
+  }
+
+  /** Нажимает «Показать», ждёт по строгим правилам и делает ретраи */
+  private async clickShowAndWaitWithRetries(
+    retries = 5,
+    waitMs = 30000,
+    waitOpts?: { minStableMs?: number; allowPaginationShortcut?: boolean; requireMinCount?: number },
+    postReadyDelayMs?: number
+  ): Promise<boolean> {
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      const showBtn = this.page!.locator('button:has-text("Показать")').first();
+      await showBtn.waitFor({ state: 'visible', timeout: 10000 });
+      await showBtn.click();
+      await this.page!.waitForTimeout(150);
+      await this.page!.waitForLoadState('networkidle').catch(() => {});
+      const ok = await this.waitForAnyUsers(waitMs, waitOpts);
+      if (ok) {
+        // пост-стабилизация, по умолчанию короткая; для new-subs можем передать 30–40с
+        await this.page!.waitForTimeout(postReadyDelayMs ?? 500);
+        return true;
+      }
+      console.log(`⏳ Пользователи не прогрузились, ретрай ${attempt}/${retries}...`);
+    }
+    return false;
+  }
+
+  /**
+   * Гарантирует, что Select2 для выбора бота открыт и виден список результатов.
+   * Если список закрылся (или ещё не открылся) — повторно кликает и «подталкивает» клавишей ArrowDown.
+   */
+  private async ensureSelect2Open(selection: Locator, maxAttempts = 5): Promise<void> {
+    if (!this.page) throw new Error('Браузер не инициализирован');
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const isOpen = await this.page.evaluate(() => {
+        const openContainer = document.querySelector('span.select2-container--open');
+        const ul = document.querySelector(
+          'ul[id^="select2-bot_id-"][id$="-results"][role="tree"]'
+        ) as HTMLElement | null;
+        const resultsVisible = !!ul && ul.getAttribute('aria-hidden') !== 'true' && ul.offsetParent !== null;
+        return !!openContainer && resultsVisible;
+      });
+
+      if (isOpen) return; // уже открыт
+
+      // Пробуем открыть: скролл к элементу, клик по нему и «стрелка вниз» на случай, если Select2 ждёт клавиатуру
+      await selection.scrollIntoViewIfNeeded().catch(() => {});
+      await selection.click({ timeout: 2000 }).catch(() => {});
+      await this.page.waitForTimeout(80);
+      await selection.press('ArrowDown').catch(() => {});
+      await this.page.waitForTimeout(150);
+    }
+
+    // Финальная проверка
+    const finallyOpen = await this.page.evaluate(() => !!document.querySelector('span.select2-container--open'));
+    if (!finallyOpen) throw new Error('Не удалось открыть выпадающий список Select2 для выбора бота.');
+  }
+
+  /**
+   * Режим new-subs:
+   * - /groups -> по каждому сообществу
+   * - /contacts -> «Добавить фильтр» -> «Завершили шаг в боте»
+   * - ставим "вчера" в От/До
+   * - перебираем всех ботов из группы «Активные»
+   * - выбираем шаг, содержащий «(начало)»
+   * - Показать -> ждём (с ретраями) -> собираем ID с пагинацией
+   * - сохраняем один txt на сообщество
+   */
+  private async parseNewSubsMode(): Promise<void> {
+    if (!this.page) throw new Error('Браузер не инициализирован');
+
+    const waitMsAfterSwitch = this.config.waitAfterSwitchMs ?? 3000;
+
+    console.log('📂 Переход на список сообществ...');
+    await this.openGroupsPage(6000);
+
+    // Сбор сообществ (как в parseGroupsMode)
+    const groups = await this.page.evaluate(() => {
+      const anchors = Array.from(document.querySelectorAll('a[onclick*="change_group_with_channel"]')) as HTMLAnchorElement[];
+      const items: { id: string; name: string }[] = [];
+      const seen = new Set<string>();
+
+      anchors.forEach(a => {
+        const onclick = a.getAttribute('onclick') || '';
+        const m = onclick.match(/change_group_with_channel\('([^']+)'/);
+        const id = m?.[1] || '';
+        if (!id || seen.has(id)) return;
+        seen.add(id);
+
+        let name = '';
+        const nameCandidate = a.querySelector('div div div div');
+        if (nameCandidate && nameCandidate.textContent) {
+          const lines = nameCandidate.textContent.split('\n').map(s => s.trim()).filter(Boolean);
+          name = (lines.find(s => !/^#/.test(s)) || lines[0] || '').trim();
+        }
+        if (!name && a.textContent) {
+          const lines = a.textContent.split('\n').map(s => s.trim()).filter(Boolean);
+          name = (lines.find(s => !/^#/.test(s)) || lines[0] || '').trim();
+        }
+
+        items.push({ id, name });
+      });
+
+      return items;
+    });
+
+    console.log(`🔎 Найдено сообществ: ${groups.length}`);
+
+    for (let i = 0; i < groups.length; i++) {
+      const g = groups[i];
+      console.log(`\\n➡️  [${i + 1}/${groups.length}] Переключаюсь на: ${g.name || g.id} (#${g.id})`);
+
+      const switchCandidate = this.page
+        .locator(`a.btn.btn-light[onclick*="${g.id}"], a.width-adaptive[onclick*="${g.id}"], a.d-flex[onclick*="${g.id}"]`)
+        .first();
+
+      if (await switchCandidate.count()) {
+        await switchCandidate.click();
+      } else {
+        await this.page.evaluate((id) => {
+          const smm = (window as any).smm;
+          if (smm && typeof smm.change_group_with_channel === 'function') {
+            smm.change_group_with_channel.call(smm, id, 'VK');
+            return;
+          }
+          const SMM = (window as any).SMM;
+          if (SMM && typeof SMM.change_group_with_channel === 'function') {
+            SMM.change_group_with_channel.call(SMM, id, 'VK');
+            return;
+          }
+          const a = document.querySelector(
+            `a[onclick*="change_group_with_channel('${id}'"]`
+          ) as HTMLAnchorElement | null;
+          if (a) a.click();
+        }, g.id);
+      }
+
+      // Устойчивость после смены сообщества (SPA может перерисовать DOM)
+      await this.page.waitForLoadState('domcontentloaded').catch(() => {});
+      await this.delay(waitMsAfterSwitch, waitMsAfterSwitch + 500);
+
+      console.log('📋 Открываем контакты выбранного сообщества...');
+      await this.openContactsPage(6000);
+
+      // 1) Ждём 5–6 секунд и жмём «Добавить фильтр»
+      await this.page.waitForTimeout(5500);
+      const addFilterBtn = this.page
+        .locator('button.link_filter:has-text("Добавить фильтр"), button:has-text("Добавить фильтр")')
+        .first();
+
+      if (await addFilterBtn.count()) {
+        await addFilterBtn.waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
+        await addFilterBtn.click();
+        await this.page.waitForSelector('.filter-list, .dropdown-menu.filter-list, .filter-list-group-item', { timeout: 10000 });
+        const filterOption = this.page
+          .locator('#filter_elem_30, .filter-list-group-item:has-text("Завершили шаг в боте")')
+          .first();
+        if (!(await filterOption.count())) throw new Error('Пункт «Завершили шаг в боте» не найден');
+        await filterOption.click();
+      } else {
+        console.log('⚠️ Кнопка «Добавить фильтр» не найдена — продолжаю без неё (попытка применить фильтр могла быть до этого)');
+      }
+
+      // 2) Ставим «вчера» в От и До
+      const yesterday = new Date();
+      yesterday.setDate(yesterday.getDate() - 1);
+      const y = this.formatDateDDMMYYYY(yesterday);
+
+      await this.page.waitForSelector('#filters-items, form#line_flex, form.line_flex', { timeout: 10000 }).catch(() => {});
+      await this.page.evaluate(function(fromTo) {
+        var selectors = ['input.bot_step_id_date_from', 'input.bot_step_id_date_to'];
+        var set = 0;
+        for (var i = 0; i < selectors.length; i++) {
+          var el = document.querySelector(selectors[i]);
+          if (el) {
+            (el as HTMLInputElement).value = fromTo as string;
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            set++;
+          }
+        }
+        if (set < 2) {
+          var form = (document.querySelector('#filters-items') || document);
+          var inputs = Array.prototype.slice.call(form.querySelectorAll('input'));
+          var candidates = inputs.filter(function(i) { return /date|datepicker/i.test(i.className); });
+          if (candidates[0]) {
+            (candidates[0] as HTMLInputElement).value = fromTo as string;
+            (candidates[0] as HTMLInputElement).dispatchEvent(new Event('input', { bubbles: true }));
+            (candidates[0] as HTMLInputElement).dispatchEvent(new Event('change', { bubbles: true }));
+          }
+          if (candidates[1]) {
+            (candidates[1] as HTMLInputElement).value = fromTo as string;
+            (candidates[1] as HTMLInputElement).dispatchEvent(new Event('input', { bubbles: true }));
+            (candidates[1] as HTMLInputElement).dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        }
+      }, y);
+
+      // 3) Собираем всех ботов в группе «Активные»
+      // Таргетим конкретно Select2, который связан с <select name="bot_id">,
+      // чтобы не перепутать с селектом шагов (multiple)
+      const botSelect = this.page
+        .locator('select[name="bot_id"] + span.select2 .select2-selection.select2-selection--single')
+        .first();
+      await this.ensureSelect2Open(botSelect);
+
+      const activeBotNames = await this.page.evaluate(function() {
+        // приоритет — явный UL с id select2-bot_id-*-results
+        const explicit =
+          (document.querySelector('ul[id^="select2-bot_id-"][id$="-results"][role="tree"][aria-hidden="false"]') as HTMLElement | null) ||
+          (document.querySelector('ul[id^="select2-bot_id-"][id$="-results"][role="tree"]') as HTMLElement | null);
+
+        const root =
+          explicit ||
+          (document.querySelector('span.select2-container--open ul.select2-results__options[role="tree"]') as HTMLElement | null);
+        if (!root) return [] as string[];
+
+        // Ищем группу «Активные»
+        let group = root.querySelector('li.select2-results__option[role="group"][aria-label="Активные"]') as HTMLElement | null;
+        if (!group) {
+          const headers = Array.prototype.slice.call(
+            root.querySelectorAll('li.select2-results__option[role="group"] .select2-results__group')
+          ) as HTMLElement[];
+          const header = headers.find(h => (h.textContent || '').trim() === 'Активные') || null;
+          group = header ? (header.closest('li.select2-results__option[role="group"]') as HTMLElement) : null;
+        }
+        if (!group) return [] as string[];
+
+        let nested = group.querySelector('ul.select2-results__options.select2-results__options--nested') as HTMLElement | null;
+        if (!nested) {
+          const header = group.querySelector('.select2-results__group') as HTMLElement | null;
+          header?.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+          header?.dispatchEvent(new MouseEvent('mouseup',   { bubbles: true }));
+          header?.dispatchEvent(new MouseEvent('click',     { bubbles: true }));
+          nested = group.querySelector('ul.select2-results__options.select2-results__options--nested') as HTMLElement | null;
+        }
+
+        const items = nested
+          ? Array.prototype.slice.call(nested.querySelectorAll('li.select2-results__option[role="treeitem"]'))
+          : [];
+        return items.map(i => (i.textContent || '').trim()).filter(Boolean);
+      });
+
+      // Небольшая пауза — даём времени дорендерить вложенные группы
+      await this.page.waitForTimeout(3000);
+
+      if (!activeBotNames || activeBotNames.length === 0) {
+        console.log('⚠️ В «Активные» ботов нет — пропускаю сообщество');
+        await this.openGroupsPage(2334);
+        continue;
+      }
+
+      console.log(`🧩 Активных ботов: ${activeBotNames.length}`);
+      const groupIds = new Set<string>();
+
+      for (let b = 0; b < activeBotNames.length; b++) {
+        const botName = activeBotNames[b];
+        console.log(`   → Бот [${b + 1}/${activeBotNames.length}]: ${botName}`);
+
+        // Выбрать бота (открыть селект и кликнуть пункт внутри открытого контейнера)
+        await this.ensureSelect2Open(botSelect);
+
+        // Предпочтительно использовать конкретный UL с id select2-bot_id-*-results внизу body
+        let rootLocator = this.page
+          .locator('ul[id^="select2-bot_id-"][id$="-results"][role="tree"][aria-hidden="false"]')
+          .first();
+        if (!(await rootLocator.count())) {
+          rootLocator = this.page
+            .locator('ul[id^="select2-bot_id-"][id$="-results"][role="tree"]')
+            .first();
+        }
+        if (!(await rootLocator.count())) {
+          rootLocator = this.page
+            .locator('span.select2-container--open ul.select2-results__options[role="tree"]')
+            .first();
+        }
+
+        // Группа «Активные»: сначала по aria-label, затем по тексту заголовка
+        let groupLocator = rootLocator
+          .locator('> li.select2-results__option[role="group"][aria-label="Активные"]')
+          .first();
+
+        if (!(await groupLocator.count())) {
+          groupLocator = rootLocator
+            .locator('> li.select2-results__option[role="group"]')
+            .filter({ has: this.page.locator('.select2-results__group', { hasText: 'Активные' }) })
+            .first();
+        }
+
+        let nestedLocator = groupLocator.locator('ul.select2-results__options.select2-results__options--nested');
+        if (!(await nestedLocator.count())) {
+          // Если дропдаун внезапно закрылся — переоткроем его
+          await this.ensureSelect2Open(botSelect);
+          await groupLocator.scrollIntoViewIfNeeded().catch(() => {});
+          for (let tries = 0; tries < 3; tries++) {
+            if (await nestedLocator.count()) break;
+            const header = groupLocator.locator('.select2-results__group').first();
+            await header.scrollIntoViewIfNeeded().catch(() => {});
+            await header.click({ timeout: 1000, force: true }).catch(() => {});
+            await this.page.waitForTimeout(120);
+            nestedLocator = groupLocator.locator('ul.select2-results__options.select2-results__options--nested');
+          }
+        }
+
+        const botItem = nestedLocator
+          .locator('li.select2-results__option[role="treeitem"]', { hasText: botName })
+          .first();
+
+        await botItem.waitFor({ state: 'visible', timeout: 2500 }).catch(() => {});
+        await botItem.scrollIntoViewIfNeeded().catch(() => {});
+        await this.page.waitForTimeout(60);
+        await botItem.click({ timeout: 5000 }).catch(() => {});
+        // даём селекту применить выбор
+        await this.page.waitForTimeout(80);
+        await this.page
+          .locator('select[name="bot_id"] + span .select2-selection__rendered')
+          .filter({ hasText: botName })
+          .first()
+          .waitFor({ state: 'visible', timeout: 1500 })
+          .catch(() => {});
+        await this.page.waitForTimeout(150);
+
+        // Выбрать шаг со строкой «(начало)»
+        const stepSelect = this.page.locator('.select_wrap.step-list .select2-selection').first();
+        await stepSelect.scrollIntoViewIfNeeded().catch(() => {});
+        await stepSelect.click({ timeout: 8000 }).catch(() => {});
+        await this.page.waitForTimeout(80);
+        await this.page
+          .waitForSelector('ul#select2-done_bot_step-results, .select2-results__options', { timeout: 4000 })
+          .catch(() => {});
+        await this.page
+          .waitForFunction(() => !!document.querySelector('li.select2-results__option'), { timeout: 2000 })
+          .catch(() => {});
+        const stepItem = this.page.locator('li.select2-results__option', { hasText: '(начало)' }).first();
+        await stepItem.waitFor({ state: 'visible', timeout: 2500 }).catch(() => {});
+        await stepItem.scrollIntoViewIfNeeded().catch(() => {});
+        await this.page.waitForTimeout(60);
+        await stepItem.click({ timeout: 5000 }).catch(() => {});
+        // коротко убеждаемся, что шаг применился
+        await this.page
+          .locator('.select_wrap.step-list .select2-selection__rendered')
+          .filter({ hasText: '(начало)' })
+          .first()
+          .waitFor({ state: 'visible', timeout: 1500 })
+          .catch(() => {});
+        await this.page.waitForTimeout(150);
+
+        // Показать + ожидание с ретраями (строгий, медленный режим)
+        const newSubsWaitMs = parseInt(process.env.NEW_SUBS_WAIT_MS || '45000');
+        const newSubsPostDelayMs = parseInt(process.env.NEW_SUBS_POST_READY_DELAY_MS || '35000');
+        const loaded = await this.clickShowAndWaitWithRetries(
+          5,
+          newSubsWaitMs,
+          { allowPaginationShortcut: false, minStableMs: 3000, requireMinCount: 1 },
+          newSubsPostDelayMs
+        );
+        if (!loaded) {
+          console.log('   ⚠️ Не удалось загрузить пользователей — пропуск бота');
+          continue;
+        }
+
+        // Пагинация и сбор ID
+        const ids = await this.collectAllContactIds();
+        ids.forEach(id => groupIds.add(id));
+        console.log(`   ✅ Собрано ID: ${ids.length}`);
+      }
+
+      // Итог по сообществу: объединённый txt
+      const savedPath = await this.writeIdsFile(Array.from(groupIds), `newsubs_group_${g.name || g.id}`);
+      console.log(`💾 ID сохранены: ${savedPath} (уникальных: ${groupIds.size})`);
+
+      // Назад к списку сообществ
+      await this.openGroupsPage(6000);
+    }
+  }
+
   /**
    * Случайная задержка между действиями для имитации человеческого поведения
    * @param min - Минимальное время задержки в миллисекундах
@@ -652,7 +1173,7 @@ async function main() {
     maxPages: process.env.MAX_PAGES ? parseInt(process.env.MAX_PAGES) : undefined,
     sessionPath: process.env.SESSION_PATH || './browser-session',
     outputFile: process.env.OUTPUT_FILE || 'bothunter_results.json',
-    mode: (process.env.MODE as 'contacts' | 'groups' | 'lists') || 'contacts',
+    mode: (process.env.MODE as 'contacts' | 'groups' | 'lists' | 'new-subs') || 'contacts',
     listFilters: process.env.LISTS_FILTER
       ? process.env.LISTS_FILTER.split(',').map(s => s.trim()).filter(Boolean)
       : undefined,

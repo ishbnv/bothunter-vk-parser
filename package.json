@@ -8,6 +8,7 @@
     "start": "tsx bothunter-vk-simple.ts",
     "start:contacts": "MODE=contacts tsx bothunter-vk-simple.ts",
     "start:groups": "MODE=groups tsx bothunter-vk-simple.ts",
+    "start:new-subs": "MODE=new-subs tsx bothunter-vk-simple.ts",
     "start:lists": "MODE=lists tsx bothunter-vk-simple.ts",
     "start:headless": "HEADLESS=true tsx bothunter-vk-simple.ts",
     "install:playwright": "playwright install chromium",
